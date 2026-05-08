@@ -1,0 +1,2 @@
+available,spy_positive_month_rate,implication
+True,0.532051282051282,A model must beat SPY's 53.2% positive-month base rate to be a useful market-timing signal. Otherwise just hold SPY.
