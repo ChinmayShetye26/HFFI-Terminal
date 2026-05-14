@@ -8,21 +8,25 @@ future mobile/desktop shell.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, Optional
 import sys
+import time
 
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+load_dotenv(ROOT / ".env")
 
 from data.asset_universe import get_assets_by_category, get_categories, to_dict_records
 from data.chart_data import fetch_history
@@ -41,6 +45,10 @@ from hffi_core.evidence_engine import (
     build_feature_evidence_table,
     build_model_card_table,
 )
+from hffi_core.investment_plan import (
+    build_investment_plan as build_long_horizon_investment_plan,
+    compare_portfolios,
+)
 from hffi_core.portfolio_advisor import (
     PortfolioHolding,
     allocation_weights_from_holdings,
@@ -50,13 +58,30 @@ from hffi_core.portfolio_advisor import (
     summarize_allocation,
     target_core_allocation,
 )
+from hffi_core.report_generator import generate_report
 from hffi_core.recommendations import generate_recommendations
 from hffi_core.scoring import DEFAULT_WEIGHTS, HouseholdInputs, compute_household_hffi
 from hffi_core.stress import apply_shock_scenarios, monte_carlo_stress
 from hffi_core.market_recommender import (
+    generate_trade_signals,
     score_markets_for_household,
     score_portfolios,
     select_one_market_recommendation,
+)
+from api.security import (
+    AuthenticatedUser,
+    LoginRequest,
+    allowed_origins,
+    audit_event,
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    payload_fingerprint,
+    public_rate_limit,
+    rate_limit,
+    require_roles,
+    security_config,
+    security_headers,
 )
 
 
@@ -83,12 +108,12 @@ class PortfolioWeightsIn(BaseModel):
 
 
 class HouseholdIn(BaseModel):
-    monthlyIncome: float = Field(default=6000, ge=0)
-    monthlyEssentialExpenses: float = Field(default=3500, ge=0)
-    monthlyTotalExpenses: float = Field(default=4500, ge=0)
-    liquidSavings: float = Field(default=8000, ge=0)
-    totalDebt: float = Field(default=22000, ge=0)
-    monthlyDebtPayment: float = Field(default=800, ge=0)
+    monthlyIncome: float = Field(default=6000, ge=0, le=1_000_000)
+    monthlyEssentialExpenses: float = Field(default=3500, ge=0, le=1_000_000)
+    monthlyTotalExpenses: float = Field(default=4500, ge=0, le=1_000_000)
+    liquidSavings: float = Field(default=8000, ge=0, le=1_000_000_000)
+    totalDebt: float = Field(default=22000, ge=0, le=1_000_000_000)
+    monthlyDebtPayment: float = Field(default=800, ge=0, le=1_000_000)
     portfolioVolatility: float = Field(default=0.16, ge=0, le=0.5)
     expectedDrawdown: float = Field(default=0.2, ge=0, le=0.8)
     rateSensitivity: float = Field(default=0.5, ge=0, le=1)
@@ -96,18 +121,35 @@ class HouseholdIn(BaseModel):
     dependents: int = Field(default=0, ge=0, le=12)
     portfolioWeights: PortfolioWeightsIn = Field(default_factory=PortfolioWeightsIn)
 
+    @model_validator(mode="after")
+    def validate_expense_consistency(self) -> "HouseholdIn":
+        if self.monthlyEssentialExpenses > self.monthlyTotalExpenses:
+            raise ValueError("Essential expenses cannot exceed total expenses.")
+        if self.monthlyDebtPayment > self.monthlyIncome * 2 and self.monthlyIncome > 0:
+            raise ValueError("Monthly debt payment is outside the supported range for this prototype.")
+        return self
+
 
 class AnalyzeRequest(BaseModel):
     household: HouseholdIn
-    holdings: list[HoldingIn] = Field(default_factory=list)
+    holdings: list[HoldingIn] = Field(default_factory=list, max_length=60)
+
+    @model_validator(mode="after")
+    def validate_holdings_count(self) -> "AnalyzeRequest":
+        counts = {"equity": 0, "bond": 0}
+        for holding in self.holdings:
+            counts[holding.category] += 1
+        if counts["equity"] > 30 or counts["bond"] > 30:
+            raise ValueError("Maximum 30 equity holdings and 30 bond holdings are supported.")
+        return self
 
 
 class BacktestRequest(BaseModel):
     household: HouseholdIn
-    holdings: list[HoldingIn] = Field(default_factory=list)
+    holdings: list[HoldingIn] = Field(default_factory=list, max_length=60)
     startDate: date = Field(default=date(2021, 1, 1))
     endDate: date = Field(default_factory=date.today)
-    initialCapital: float = Field(default=100000, gt=0)
+    initialCapital: float = Field(default=100000, gt=0, le=100_000_000)
     frequency: Literal["weekly", "monthly", "quarterly"] = "monthly"
     transactionCostPct: float = Field(default=0.001, ge=0, le=0.05)
     benchmarkTicker: str = Field(default="SPY", max_length=24)
@@ -120,6 +162,26 @@ class BacktestRequest(BaseModel):
             raise ValueError("Benchmark ticker contains unsupported characters.")
         return ticker or "SPY"
 
+    @model_validator(mode="after")
+    def validate_backtest_scope(self) -> "BacktestRequest":
+        if self.endDate <= self.startDate:
+            raise ValueError("End date must be after start date.")
+        if (self.endDate - self.startDate).days > 3650:
+            raise ValueError("Backtest date range is limited to 10 years.")
+        counts = {"equity": 0, "bond": 0}
+        for holding in self.holdings:
+            counts[holding.category] += 1
+        if counts["equity"] > 30 or counts["bond"] > 30:
+            raise ValueError("Maximum 30 equity holdings and 30 bond holdings are supported.")
+        return self
+
+
+class ReportRequest(AnalyzeRequest):
+    initialCapital: float = Field(default=100000, gt=0, le=100_000_000)
+    monthlyContribution: float = Field(default=500, ge=0, le=1_000_000)
+    horizonYears: int = Field(default=10, ge=1, le=30)
+    annualContributionGrowth: float = Field(default=0.03, ge=0, le=0.25)
+
 
 app = FastAPI(
     title="HFFI Terminal API",
@@ -129,16 +191,41 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=allowed_origins(),
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+@app.middleware("http")
+async def add_security_headers_and_audit(request: Request, call_next):
+    started = time.perf_counter()
+    response: Response
+    try:
+        response = await call_next(request)
+    except Exception:
+        audit_event(
+            "request_error",
+            method=request.method,
+            path=request.url.path,
+            client=request.client.host if request.client else "unknown",
+        )
+        raise
+    for key, value in security_headers().items():
+        response.headers.setdefault(key, value)
+    if request.url.scheme == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+    audit_event(
+        "request",
+        method=request.method,
+        path=request.url.path,
+        status=response.status_code,
+        ms=elapsed_ms,
+        client=request.client.host if request.client else "unknown",
+    )
+    return response
 
 
 @lru_cache(maxsize=1)
@@ -903,13 +990,107 @@ def _run_backtest(payload: BacktestRequest) -> dict[str, Any]:
     })
 
 
+def _generate_excel_report(payload: ReportRequest) -> Path:
+    macro = _macro_snapshot()
+    holdings_df = _holdings_frame(payload.holdings, payload.household.liquidSavings)
+    if not holdings_df.empty:
+        weights = allocation_weights_from_holdings(holdings_df)
+    else:
+        weights = payload.household.portfolioWeights.model_dump()
+        total = sum(weights.values()) or 1.0
+        weights = {key: float(value) / total for key, value in weights.items()}
+
+    inputs = _to_household_inputs(payload.household, weights)
+    result = compute_household_hffi(inputs, macro, weights=DEFAULT_WEIGHTS)
+    portfolio_scores = score_portfolios(result.score)
+    portfolio_choice = str(portfolio_scores.iloc[0]["portfolio"]) if not portfolio_scores.empty else "Balanced"
+    plan = build_long_horizon_investment_plan(
+        portfolio=portfolio_choice,
+        horizon_years=payload.horizonYears,
+        initial_capital=payload.initialCapital,
+        monthly_contribution=payload.monthlyContribution,
+        annual_contribution_growth=payload.annualContributionGrowth,
+        n_sims=3000,
+    )
+    comparison = compare_portfolios(
+        horizon_years=payload.horizonYears,
+        initial_capital=payload.initialCapital,
+        monthly_contribution=payload.monthlyContribution,
+        annual_contribution_growth=payload.annualContributionGrowth,
+    )
+    recs = generate_recommendations(result, inputs)
+    stress = apply_shock_scenarios(inputs, macro)
+
+    trade_signals = []
+    market_df = _market_universe_snapshot()
+    if not market_df.empty:
+        debt_service_ratio, liquidity_buffer_6m, macro_stress, risk_off = _market_scoring_inputs(inputs, macro)
+        market_scores = score_markets_for_household(
+            hffi=result.score,
+            risk_band=result.band,
+            debt_service_ratio=debt_service_ratio,
+            macro_stress_index=macro_stress,
+            liquidity_buffer_6m=liquidity_buffer_6m,
+            market_snapshot=market_df,
+            risk_off_regime=risk_off,
+        )
+        trade_signals = generate_trade_signals(
+            portfolio_choice=portfolio_choice,
+            market_scores=market_scores,
+            asset_metadata=pd.DataFrame(_asset_records()),
+        )
+
+    output_path = ROOT / "reports" / f"hffi_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    return generate_report(
+        output_path=output_path,
+        fragility_result=result,
+        investment_plan=plan,
+        macro=macro,
+        portfolio_choice=portfolio_choice,
+        initial_capital=payload.initialCapital,
+        monthly_contribution=payload.monthlyContribution,
+        horizon_years=payload.horizonYears,
+        portfolio_comparison=comparison,
+        trade_signals=trade_signals,
+        stress_scenarios=stress,
+        recommendations=recs,
+    )
+
+
+@app.get("/api/security/config")
+def api_security_config() -> dict[str, Any]:
+    return security_config()
+
+
+@app.post("/api/auth/login", dependencies=[Depends(public_rate_limit("auth_login", 8, 60))])
+def login(payload: LoginRequest, request: Request) -> dict[str, Any]:
+    user = authenticate_user(payload.username, payload.password)
+    client = request.client.host if request.client else "unknown"
+    if user is None:
+        audit_event("login_failed", username=payload.username, client=client)
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+    token = create_access_token(user)
+    audit_event("login_success", username=user.username, role=user.role, client=client)
+    return {
+        "accessToken": token,
+        "tokenType": "bearer",
+        "expiresIn": security_config()["tokenTtlMinutes"] * 60,
+        "user": {"username": user.username, "role": user.role},
+    }
+
+
+@app.get("/api/auth/me", dependencies=[Depends(rate_limit("auth_me", 60, 60))])
+def auth_me(user: AuthenticatedUser = Depends(get_current_user)) -> dict[str, Any]:
+    return {"user": {"username": user.username, "role": user.role}}
+
+
 @app.get("/api/health")
 def health() -> dict[str, Any]:
     return {"status": "ok", "service": "hffi-terminal-api"}
 
 
-@app.get("/api/assets")
-def assets() -> dict[str, Any]:
+@app.get("/api/assets", dependencies=[Depends(rate_limit("assets", 120, 60))])
+def assets(user: AuthenticatedUser = Depends(get_current_user)) -> dict[str, Any]:
     grouped = {}
     for category in get_categories():
         grouped[category] = [
@@ -925,8 +1106,8 @@ def assets() -> dict[str, Any]:
     return {"categories": get_categories(), "assets": grouped}
 
 
-@app.get("/api/market/{category}")
-def market_snapshot(category: str) -> dict[str, Any]:
+@app.get("/api/market/{category}", dependencies=[Depends(rate_limit("market", 40, 60))])
+def market_snapshot(category: str, user: AuthenticatedUser = Depends(get_current_user)) -> dict[str, Any]:
     assets = get_assets_by_category(category)
     if not assets:
         raise HTTPException(status_code=404, detail="Unknown category.")
@@ -950,11 +1131,17 @@ def market_snapshot(category: str) -> dict[str, Any]:
     return {"category": category, "rows": _jsonable(rows)}
 
 
-@app.get("/api/chart/{ticker}")
-def chart(ticker: str, period: str = "6mo", interval: str = "1d") -> dict[str, Any]:
+@app.get("/api/chart/{ticker}", dependencies=[Depends(rate_limit("chart", 20, 60))])
+def chart(ticker: str, period: str = "6mo", interval: str = "1d", user: AuthenticatedUser = Depends(get_current_user)) -> dict[str, Any]:
     safe = sanitize_ticker(ticker)
     if not safe:
         raise HTTPException(status_code=400, detail="Invalid ticker.")
+    allowed_periods = {"1d", "5d", "1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "max"}
+    allowed_intervals = {"1m", "2m", "5m", "15m", "30m", "60m", "90m", "1h", "1d", "5d", "1wk", "1mo", "3mo"}
+    if period not in allowed_periods:
+        raise HTTPException(status_code=422, detail="Unsupported chart period.")
+    if interval not in allowed_intervals:
+        raise HTTPException(status_code=422, detail="Unsupported chart interval.")
     df = fetch_history(safe, period=period, interval=interval)
     if df.empty:
         return {"ticker": safe, "dataSource": "empty", "rows": []}
@@ -971,13 +1158,28 @@ def chart(ticker: str, period: str = "6mo", interval: str = "1d") -> dict[str, A
     return {"ticker": safe, "dataSource": df.attrs.get("data_source", "live:yfinance"), "rows": _jsonable(rows)}
 
 
-@app.post("/api/backtest")
-def backtest(payload: BacktestRequest) -> dict[str, Any]:
-    return _run_backtest(payload)
+@app.post(
+    "/api/backtest",
+    dependencies=[
+        Depends(rate_limit("backtest", 5, 60)),
+        Depends(require_roles("admin", "analyst")),
+    ],
+)
+def backtest(payload: BacktestRequest, user: AuthenticatedUser = Depends(get_current_user)) -> dict[str, Any]:
+    result = _run_backtest(payload)
+    audit_event(
+        "backtest_completed",
+        user=user.username,
+        role=user.role,
+        fingerprint=payload_fingerprint(payload.model_dump()),
+        trades=len(result.get("trades", [])),
+        metrics=len(result.get("metrics", [])),
+    )
+    return result
 
 
-@app.get("/api/backtest")
-def backtest_info() -> dict[str, Any]:
+@app.get("/api/backtest", dependencies=[Depends(rate_limit("backtest_info", 60, 60))])
+def backtest_info(user: AuthenticatedUser = Depends(get_current_user)) -> dict[str, Any]:
     return {
         "status": "available",
         "method": "POST",
@@ -985,8 +1187,37 @@ def backtest_info() -> dict[str, Any]:
     }
 
 
-@app.post("/api/analyze")
-def analyze(payload: AnalyzeRequest) -> dict[str, Any]:
+@app.post(
+    "/api/report/excel",
+    dependencies=[
+        Depends(rate_limit("report_excel", 5, 60)),
+        Depends(require_roles("admin", "analyst")),
+    ],
+)
+def excel_report(payload: ReportRequest, user: AuthenticatedUser = Depends(get_current_user)) -> FileResponse:
+    output_path = _generate_excel_report(payload)
+    audit_event(
+        "excel_report_generated",
+        user=user.username,
+        role=user.role,
+        fingerprint=payload_fingerprint(payload.model_dump()),
+        file=output_path.name,
+    )
+    return FileResponse(
+        path=output_path,
+        filename=output_path.name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+@app.post(
+    "/api/analyze",
+    dependencies=[
+        Depends(rate_limit("analyze", 30, 60)),
+        Depends(require_roles("admin", "analyst")),
+    ],
+)
+def analyze(payload: AnalyzeRequest, user: AuthenticatedUser = Depends(get_current_user)) -> dict[str, Any]:
     macro = _macro_snapshot()
     holdings_df = _holdings_frame(payload.holdings, payload.household.liquidSavings)
     if not holdings_df.empty:
@@ -1120,7 +1351,7 @@ def analyze(payload: AnalyzeRequest) -> dict[str, Any]:
         {"category": "cash", "invested_amount": 0, "actual_weight": actual_weights.get("cash", 0)},
     ])
 
-    return _jsonable({
+    response_payload = _jsonable({
         "macro": macro,
         "hffi": {
             "score": result.score,
@@ -1176,3 +1407,14 @@ def analyze(payload: AnalyzeRequest) -> dict[str, Any]:
         "portfolioScores": portfolio_scores,
         "riskOff": risk_off,
     })
+    audit_event(
+        "analysis_completed",
+        user=user.username,
+        role=user.role,
+        fingerprint=payload_fingerprint(payload.model_dump()),
+        hffi=round(float(result.score), 2),
+        band=str(result.band).replace(" ", "_"),
+        holding_actions=len(holding_actions),
+        investment_candidates=len(investment_plan),
+    )
+    return response_payload

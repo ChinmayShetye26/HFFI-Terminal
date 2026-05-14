@@ -52,6 +52,13 @@ export type BacktestRequest = {
   benchmarkTicker: string;
 };
 
+export type ReportRequest = AnalyzeRequest & {
+  initialCapital: number;
+  monthlyContribution: number;
+  horizonYears: number;
+  annualContributionGrowth: number;
+};
+
 export type HffiResult = {
   score: number;
   band: string;

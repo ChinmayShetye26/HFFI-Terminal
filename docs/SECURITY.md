@@ -1,23 +1,58 @@
-# Security Measures For HFFI Terminal
+# HFFI Terminal Security Controls
 
-Implemented safeguards:
+The terminal handles sensitive household finance inputs. The current build adds
+the following safeguards:
 
-1. **No chatbot tab in the terminal**: the Streamlit UI no longer sends user data to an LLM service.
-2. **Secret hygiene**: `.env.example` and `.env.example.txt` contain placeholders only. Real keys belong only in local `.env`, which is gitignored.
-3. **No direct trading execution**: recommendations are educational decision-support outputs. The app never places orders or connects to brokerage trading endpoints.
-4. **Ticker validation**: chart and market-data requests accept only bounded ticker symbols with safe characters.
-5. **Provider scoping**: paid provider keys are optional and selected explicitly with `MARKET_PROVIDER`.
-6. **FRED no-key fallback**: macro data can use FRED public CSV, reducing the need to distribute API keys for demos.
-7. **Local persistence only**: household runs remain in local SQLite by default.
-8. **Input minimization**: detailed holdings are used for current calculations and are not added to outbound model calls.
-9. **Cache isolation**: market-data cache files are keyed by provider and ticker set to avoid mixing results across categories or portfolios.
+- Authentication with HMAC-signed bearer tokens.
+- Role-based access for analytical endpoints.
+- Rate limits for login, chart, market, analysis, and backtesting endpoints.
+- Strict CORS configured through `HFFI_ALLOWED_ORIGINS`.
+- Security headers on API responses, including CSP, frame protection, no-sniff,
+  referrer policy, permissions policy, and no-store cache control.
+- Server-side validation for tickers, holdings count, financial input ranges,
+  date ranges, and chart period/interval values.
+- Safe audit logging in `logs/security_audit.log` without raw income, savings,
+  debt, or expense values.
+- API keys and credentials read from `.env`; sample files contain placeholders
+  only.
+- No trade execution. The app remains educational decision-support software.
 
-Recommended production hardening:
+## Local Credentials
 
-1. Add Streamlit authentication and deploy behind HTTPS.
-2. Encrypt SQLite or move sensitive records to an encrypted managed database.
-3. Rotate any API key that was ever committed, copied into a report, or shared in screenshots.
-4. Add role-based access controls for advisors, analysts, and household users.
-5. Add audit logging for report generation and data exports.
-6. Add automated secret scanning in CI.
-7. Add explicit privacy notices before collecting real household holdings.
+Create `.env` from `.env.example` and change the defaults:
+
+```text
+HFFI_AUTH_ENABLED=true
+HFFI_SECRET_KEY=replace-with-a-long-random-secret
+HFFI_ADMIN_USERNAME=admin
+HFFI_ADMIN_PASSWORD=change-me-now
+HFFI_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+```
+
+Optional role accounts:
+
+```text
+HFFI_ANALYST_USERNAME=analyst
+HFFI_ANALYST_PASSWORD=replace-me
+HFFI_VIEWER_USERNAME=viewer
+HFFI_VIEWER_PASSWORD=replace-me
+```
+
+`admin` and `analyst` can run analysis/backtesting. `viewer` can access read
+endpoints such as assets, charts, market snapshots, and `/api/auth/me`.
+
+## Production Checklist
+
+- Replace `HFFI_SECRET_KEY` with a long random value.
+- Replace all demo passwords and prefer password hashes.
+- Deploy behind HTTPS/TLS.
+- Set `HFFI_ALLOWED_ORIGINS` to the production frontend domain only.
+- Keep `.env` out of Git.
+- Rotate API keys if they were ever committed or shared.
+- Run dependency scans regularly:
+  - `npm audit`
+  - `pip-audit` when available
+- Or run the bundled check script:
+  - `.\scripts\security_check.ps1`
+- Review `logs/security_audit.log` for repeated login failures or rate-limit
+  events.

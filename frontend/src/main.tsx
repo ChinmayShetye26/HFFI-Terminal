@@ -2,9 +2,15 @@ import React, { useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   analyzePortfolio,
+  clearStoredToken,
+  exportExcelReport,
   fetchAssets,
   fetchChart,
+  fetchCurrentUser,
   fetchMarket,
+  fetchSecurityConfig,
+  getStoredToken,
+  login,
   runBacktest,
 } from "./api";
 import { clamp, money, number, percent, signedNumber, signedPercent } from "./format";
@@ -19,6 +25,7 @@ import type {
   HouseholdInput,
   MarketSnapshotRow,
 } from "./types";
+import type { AuthUser } from "./api";
 import "./styles.css";
 
 const DEFAULT_HOUSEHOLD: HouseholdInput = {
@@ -103,26 +110,63 @@ function App() {
   const [analysis, setAnalysis] = useState<AnalysisResponse | null>(null);
   const [activeTab, setActiveTab] = useState<Tab>("fragility");
   const [loading, setLoading] = useState(false);
+  const [reporting, setReporting] = useState(false);
   const [error, setError] = useState("");
+  const [authReady, setAuthReady] = useState(false);
+  const [authEnabled, setAuthEnabled] = useState(true);
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null);
+  const [authToken, setAuthToken] = useState(getStoredToken());
   const allocation = useMemo(
     () => calculatePortfolioAllocation(holdings, household.liquidSavings),
     [holdings, household.liquidSavings],
   );
 
   useEffect(() => {
-    fetchAssets()
-      .then((payload) => setAssets(payload.assets))
-      .catch((err) => setError(err.message));
+    fetchSecurityConfig()
+      .then(async (config) => {
+        setAuthEnabled(config.authEnabled);
+        if (!config.authEnabled) {
+          setAuthUser({ username: "local-dev", role: "admin" });
+          return;
+        }
+        const storedToken = getStoredToken();
+        if (!storedToken) return;
+        try {
+          const current = await fetchCurrentUser();
+          setAuthUser(current.user);
+          setAuthToken(storedToken);
+        } catch {
+          clearStoredToken();
+          setAuthToken("");
+          setAuthUser(null);
+        }
+      })
+      .catch((err) => setError(err.message))
+      .finally(() => setAuthReady(true));
   }, []);
 
   useEffect(() => {
+    if (!authReady) return;
+    if (authEnabled && !authToken) return;
+    fetchAssets()
+      .then((payload) => setAssets(payload.assets))
+      .catch((err) => setError(err.message));
+  }, [authReady, authEnabled, authToken]);
+
+  useEffect(() => {
+    if (!authReady) return;
+    if (authEnabled && !authToken) return;
     const id = window.setTimeout(() => {
       void runAnalysis(false);
     }, 650);
     return () => window.clearTimeout(id);
-  }, [household, holdings]);
+  }, [household, holdings, authReady, authEnabled, authToken]);
 
   async function runAnalysis(showLoading = true) {
+    if (authEnabled && !authToken) {
+      setError("Please log in before running analysis.");
+      return;
+    }
     try {
       if (showLoading) setLoading(true);
       const payloadHousehold = { ...household, portfolioWeights: allocation.weights };
@@ -136,11 +180,72 @@ function App() {
     }
   }
 
+  async function exportReport() {
+    if (authEnabled && !authToken) {
+      setError("Please log in before exporting a report.");
+      return;
+    }
+    setReporting(true);
+    try {
+      const payloadHousehold = { ...household, portfolioWeights: allocation.weights };
+      const buyingCapacity = Math.max(
+        household.monthlyIncome - household.monthlyTotalExpenses - household.monthlyDebtPayment,
+        0,
+      );
+      const blob = await exportExcelReport({
+        household: payloadHousehold,
+        holdings,
+        initialCapital: Math.max(allocation.total, 10000),
+        monthlyContribution: buyingCapacity,
+        horizonYears: 10,
+        annualContributionGrowth: 0.03,
+      });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `hffi_report_${new Date().toISOString().slice(0, 19).replaceAll(":", "")}.xlsx`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+      setError("");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Report export failed");
+    } finally {
+      setReporting(false);
+    }
+  }
+
+  async function handleLogin(username: string, password: string) {
+    const payload = await login(username, password);
+    setAuthToken(payload.accessToken);
+    setAuthUser(payload.user);
+    setError("");
+  }
+
+  function handleLogout() {
+    clearStoredToken();
+    setAuthToken("");
+    setAuthUser(null);
+    setAnalysis(null);
+    setAssets(null);
+  }
+
   const categories = useMemo(() => Object.keys(assets ?? {}) as AssetCategory[], [assets]);
+  if (!authReady) return <LoadingShell />;
+  if (authEnabled && !authToken) return <LoginScreen error={error} onLogin={handleLogin} />;
 
   return (
     <div className="terminal-shell">
-      <TopBar loading={loading} analysis={analysis} onAnalyze={() => void runAnalysis(true)} />
+      <TopBar
+        loading={loading}
+        reporting={reporting}
+        analysis={analysis}
+        onAnalyze={() => void runAnalysis(true)}
+        onExport={() => void exportReport()}
+        user={authUser}
+        onLogout={authEnabled ? handleLogout : undefined}
+      />
       <div className="terminal-grid">
         <aside className="left-rail">
           <ControlDeck household={household} onChange={setHousehold} />
@@ -150,6 +255,7 @@ function App() {
 
         <main className="workspace">
           {error ? <div className="alert">{error}</div> : null}
+          <SecurityNotice />
           <Nav active={activeTab} onChange={setActiveTab} />
           {activeTab === "fragility" && <FragilityPanel analysis={analysis} />}
           {activeTab === "portfolio" && (
@@ -176,14 +282,95 @@ function App() {
   );
 }
 
+function LoadingShell() {
+  return (
+    <div className="terminal-shell login-shell">
+      <section className="login-panel">
+        <div className="brand">HFFI INVESTMENT TERMINAL</div>
+        <p>Starting secure session...</p>
+      </section>
+    </div>
+  );
+}
+
+function LoginScreen({
+  error,
+  onLogin,
+}: {
+  error: string;
+  onLogin: (username: string, password: string) => Promise<void>;
+}) {
+  const [username, setUsername] = useState("admin");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [localError, setLocalError] = useState("");
+
+  async function submit(event: React.FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    setLocalError("");
+    try {
+      await onLogin(username, password);
+    } catch (err) {
+      setLocalError(err instanceof Error ? err.message : "Login failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="terminal-shell login-shell">
+      <form className="login-panel" onSubmit={submit}>
+        <div className="brand">HFFI INVESTMENT TERMINAL</div>
+        <h1>Secure Access</h1>
+        <p>Login is required before analyzing household financial data or running market backtests.</p>
+        <label className="field">
+          <span>Username</span>
+          <input value={username} autoComplete="username" onChange={(e) => setUsername(e.target.value)} />
+        </label>
+        <label className="field">
+          <span>Password</span>
+          <input
+            type="password"
+            value={password}
+            autoComplete="current-password"
+            onChange={(e) => setPassword(e.target.value)}
+          />
+        </label>
+        {localError || error ? <div className="alert">{localError || error}</div> : null}
+        <button className="primary-button" disabled={busy}>
+          {busy ? "Signing in" : "Sign In"}
+        </button>
+        <footer>Default local credentials are configured in `.env`. Change them before deployment.</footer>
+      </form>
+    </div>
+  );
+}
+
+function SecurityNotice() {
+  return (
+    <div className="security-banner">
+      Educational decision-support only. No trade execution. Financial inputs are validated server-side, requests are rate-limited, and audit logs avoid raw income, debt, and savings values.
+    </div>
+  );
+}
+
 function TopBar({
   loading,
+  reporting,
   analysis,
   onAnalyze,
+  onExport,
+  user,
+  onLogout,
 }: {
   loading: boolean;
+  reporting: boolean;
   analysis: AnalysisResponse | null;
   onAnalyze: () => void;
+  onExport: () => void;
+  user: AuthUser | null;
+  onLogout?: () => void;
 }) {
   return (
     <header className="topbar">
@@ -196,9 +383,16 @@ function TopBar({
         <TapeItem label="REGIME" value={analysis?.riskOff ? "RISK OFF" : "RISK ON"} tone={analysis?.riskOff ? "warn" : "good"} />
         <TapeItem label="SEGMENT" value={analysis?.segment ?? "--"} />
       </div>
-      <button className="primary-button" onClick={onAnalyze} disabled={loading}>
-        {loading ? "Analyzing" : "Run Analysis"}
-      </button>
+      <div className="topbar-actions">
+        {user ? <div className="security-chip">{user.username}<span>{user.role}</span></div> : null}
+        <button className="primary-button" onClick={onAnalyze} disabled={loading}>
+          {loading ? "Analyzing" : "Run Analysis"}
+        </button>
+        <button className="ghost-button export-button" onClick={onExport} disabled={reporting}>
+          {reporting ? "Exporting" : "Export Excel"}
+        </button>
+        {onLogout ? <button className="ghost-button" onClick={onLogout}>Logout</button> : null}
+      </div>
     </header>
   );
 }

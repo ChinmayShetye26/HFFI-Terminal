@@ -61,6 +61,39 @@ button {
   backdrop-filter: blur(14px);
 }
 
+.topbar-actions {
+  display: grid;
+  grid-template-columns: minmax(94px, auto) minmax(120px, auto);
+  gap: 8px;
+  align-items: center;
+}
+
+.topbar-actions .ghost-button {
+  min-height: 30px;
+}
+
+.topbar-actions .export-button {
+  grid-column: 1 / 2;
+}
+
+.security-chip {
+  display: grid;
+  min-height: 38px;
+  align-content: center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0b0f12;
+  color: var(--text);
+  padding: 6px 9px;
+  font-size: 12px;
+}
+
+.security-chip span {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
 .brand {
   color: var(--amber);
   font-size: 20px;
@@ -129,6 +162,17 @@ button {
 
 .workspace {
   min-width: 0;
+}
+
+.security-banner {
+  margin-bottom: 14px;
+  border: 1px solid rgba(67, 198, 183, 0.36);
+  border-radius: 8px;
+  background: rgba(67, 198, 183, 0.08);
+  color: #c7f3ed;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .panel {
@@ -1371,6 +1415,43 @@ input[type="range"] {
   background: rgba(224, 91, 85, 0.12);
   color: #ffd0cd;
   padding: 10px 12px;
+}
+
+.login-shell {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: 18px;
+}
+
+.login-panel {
+  width: min(100%, 420px);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(16, 20, 24, 0.98);
+  box-shadow: var(--shadow);
+  padding: 22px;
+}
+
+.login-panel h1 {
+  margin: 18px 0 8px;
+  color: var(--text);
+  font-size: 24px;
+}
+
+.login-panel p,
+.login-panel footer {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.login-panel footer {
+  margin-top: 12px;
+}
+
+.login-panel .primary-button {
+  width: 100%;
 }
 
 .backtest-layout {
